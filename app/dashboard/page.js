@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react'
 import { supabase } from '../../lib/supabaseClient'
 import { useRouter } from 'next/navigation'
+import Link from 'next/link'
 
 export default function Dashboard() {
   const [user, setUser] = useState(null)
@@ -39,6 +40,20 @@ export default function Dashboard() {
         >
           Log out
         </button>
+        <div className="flex gap-3 justify-center">
+  <Link
+    href="/articles"
+    className="bg-blue-400 text-[#0a0f1e] px-6 py-2.5 rounded-lg text-sm hover:opacity-80 transition font-medium"
+  >
+    Go to Articles
+  </Link>
+  <button
+    onClick={handleLogout}
+    className="bg-[#0a0f1e] text-white px-6 py-2.5 rounded-lg text-sm hover:opacity-80 transition"
+  >
+    Log out
+  </button>
+</div>
       </div>
     </main>
   )
