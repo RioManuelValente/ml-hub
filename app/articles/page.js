@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState, useRef } from 'react'
+import { useEffect, useState, useRef, useCallback } from 'react'
 import { supabase } from '../../lib/supabaseClient'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
@@ -14,85 +14,19 @@ export default function ArticlesPage() {
   const [openComments, setOpenComments] = useState({})
   const [commentInputs, setCommentInputs] = useState({})
   const [postingComment, setPostingComment] = useState({})
+  const [openReplies, setOpenReplies] = useState({})
+  const [replyInputs, setReplyInputs] = useState({})
+  const [showReplyInput, setShowReplyInput] = useState({})
+  const [postingReply, setPostingReply] = useState({})
   const [confirmDelete, setConfirmDelete] = useState(null)
   const [toast, setToast] = useState('')
   const [notifications, setNotifications] = useState([])
   const [notifOpen, setNotifOpen] = useState(false)
   const notifRef = useRef(null)
+  const userRef = useRef(null)
   const router = useRouter()
 
-  useEffect(() => {
-    supabase.auth.getUser().then(({ data }) => {
-      if (!data.user) {
-        router.push('/auth')
-      } else {
-        setUser(data.user)
-        fetchArticles(data.user.id)
-        fetchNotifications(data.user.id)
-        subscribeToNotifications(data.user.id)
-      }
-    })
-  }, [])
-
-  useEffect(() => {
-    function handleClick(e) {
-      if (notifRef.current && !notifRef.current.contains(e.target)) {
-        setNotifOpen(false)
-      }
-    }
-    document.addEventListener('mousedown', handleClick)
-    return () => document.removeEventListener('mousedown', handleClick)
-  }, [])
-
-  function subscribeToNotifications(userId) {
-    supabase
-      .channel('notifications-channel')
-      .on(
-        'postgres_changes',
-        {
-          event: 'INSERT',
-          schema: 'public',
-          table: 'notifications',
-          filter: `user_id=eq.${userId}`,
-        },
-        (payload) => {
-          setNotifications(prev => [payload.new, ...prev])
-        }
-      )
-      .subscribe()
-  }
-
-  async function fetchNotifications(userId) {
-    const { data } = await supabase
-      .from('notifications')
-      .select('*')
-      .eq('user_id', userId)
-      .order('created_at', { ascending: false })
-      .limit(20)
-    if (data) setNotifications(data)
-  }
-
-  async function markNotifRead(id) {
-    await supabase
-      .from('notifications')
-      .update({ is_read: true })
-      .eq('id', id)
-    setNotifications(prev =>
-      prev.map(n => (n.id === id ? { ...n, is_read: true } : n))
-    )
-  }
-
-  async function markAllRead() {
-    const unreadIds = notifications.filter(n => !n.is_read).map(n => n.id)
-    if (unreadIds.length === 0) return
-    await supabase
-      .from('notifications')
-      .update({ is_read: true })
-      .in('id', unreadIds)
-    setNotifications(prev => prev.map(n => ({ ...n, is_read: true })))
-  }
-
-  async function fetchArticles(userId) {
+  const fetchArticles = useCallback(async (userId) => {
     const { data: articleData } = await supabase
       .from('articles')
       .select('*')
@@ -109,23 +43,47 @@ export default function ArticlesPage() {
     const { data: commentLikes } = await supabase
       .from('comment_likes')
       .select('*')
+    const { data: replyData } = await supabase
+      .from('replies')
+      .select('*')
+      .order('created_at', { ascending: true })
+    const { data: replyLikes } = await supabase
+      .from('reply_likes')
+      .select('*')
 
     const enriched = articleData.map(article => {
       const likes = articleLikes?.filter(l => l.article_id === article.id) || []
       const myLike = likes.find(l => l.user_id === userId)
+
       const articleComments = (commentData || [])
         .filter(c => c.article_id === article.id)
         .map(c => {
           const cLikes = commentLikes?.filter(l => l.comment_id === c.id) || []
           const myCommentLike = cLikes.find(l => l.user_id === userId)
+
+          const commentReplies = (replyData || [])
+            .filter(r => r.comment_id === c.id)
+            .map(r => {
+              const rLikes = replyLikes?.filter(l => l.reply_id === r.id) || []
+              const myReplyLike = rLikes.find(l => l.user_id === userId)
+              return {
+                ...r,
+                likeCount: rLikes.length,
+                myLikeId: myReplyLike?.id || null,
+                liked: !!myReplyLike,
+              }
+            })
+
           return {
             ...c,
             likeCount: cLikes.length,
             myLikeId: myCommentLike?.id || null,
             liked: !!myCommentLike,
+            replies: commentReplies,
           }
         })
         .sort((a, b) => b.likeCount - a.likeCount)
+
       return {
         ...article,
         likeCount: likes.length,
@@ -136,6 +94,97 @@ export default function ArticlesPage() {
     }).sort((a, b) => b.likeCount - a.likeCount)
 
     setArticles(enriched)
+  }, [])
+
+  useEffect(() => {
+    supabase.auth.getUser().then(({ data }) => {
+      if (!data.user) {
+        router.push('/auth')
+      } else {
+        userRef.current = data.user
+        setUser(data.user)
+        fetchArticles(data.user.id)
+        fetchNotifications(data.user.id)
+        subscribeToAll(data.user.id)
+      }
+    })
+    return () => { supabase.removeAllChannels() }
+  }, [])
+
+  useEffect(() => {
+    function handleClick(e) {
+      if (notifRef.current && !notifRef.current.contains(e.target)) {
+        setNotifOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', handleClick)
+    return () => document.removeEventListener('mousedown', handleClick)
+  }, [])
+
+  function subscribeToAll(userId) {
+    supabase
+      .channel('notifications-live')
+      .on('postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'notifications', filter: `user_id=eq.${userId}` },
+        (payload) => { setNotifications(prev => [payload.new, ...prev]) }
+      ).subscribe()
+
+    supabase
+      .channel('article-likes-live')
+      .on('postgres_changes',
+        { event: '*', schema: 'public', table: 'article_likes' },
+        () => { fetchArticles(userRef.current?.id) }
+      ).subscribe()
+
+    supabase
+      .channel('comments-live')
+      .on('postgres_changes',
+        { event: '*', schema: 'public', table: 'comments' },
+        () => { fetchArticles(userRef.current?.id) }
+      ).subscribe()
+
+    supabase
+      .channel('comment-likes-live')
+      .on('postgres_changes',
+        { event: '*', schema: 'public', table: 'comment_likes' },
+        () => { fetchArticles(userRef.current?.id) }
+      ).subscribe()
+
+    supabase
+      .channel('replies-live')
+      .on('postgres_changes',
+        { event: '*', schema: 'public', table: 'replies' },
+        () => { fetchArticles(userRef.current?.id) }
+      ).subscribe()
+
+    supabase
+      .channel('reply-likes-live')
+      .on('postgres_changes',
+        { event: '*', schema: 'public', table: 'reply_likes' },
+        () => { fetchArticles(userRef.current?.id) }
+      ).subscribe()
+  }
+
+  async function fetchNotifications(userId) {
+    const { data } = await supabase
+      .from('notifications')
+      .select('*')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false })
+      .limit(20)
+    if (data) setNotifications(data)
+  }
+
+  async function markNotifRead(id) {
+    await supabase.from('notifications').update({ is_read: true }).eq('id', id)
+    setNotifications(prev => prev.map(n => n.id === id ? { ...n, is_read: true } : n))
+  }
+
+  async function markAllRead() {
+    const unreadIds = notifications.filter(n => !n.is_read).map(n => n.id)
+    if (unreadIds.length === 0) return
+    await supabase.from('notifications').update({ is_read: true }).in('id', unreadIds)
+    setNotifications(prev => prev.map(n => ({ ...n, is_read: true })))
   }
 
   async function handlePost() {
@@ -150,7 +199,6 @@ export default function ArticlesPage() {
     setTitle('')
     setBody('')
     setPosting(false)
-    fetchArticles(user.id)
   }
 
   async function toggleArticleLike(article) {
@@ -170,10 +218,9 @@ export default function ArticlesPage() {
         })
       }
     }
-    fetchArticles(user.id)
   }
 
-  async function toggleCommentLike(comment, articleUserId) {
+  async function toggleCommentLike(comment) {
     if (comment.liked) {
       await supabase.from('comment_likes').delete().eq('id', comment.myLikeId)
     } else {
@@ -190,7 +237,25 @@ export default function ArticlesPage() {
         })
       }
     }
-    fetchArticles(user.id)
+  }
+
+  async function toggleReplyLike(reply) {
+    if (reply.liked) {
+      await supabase.from('reply_likes').delete().eq('id', reply.myLikeId)
+    } else {
+      await supabase.from('reply_likes').insert({
+        reply_id: reply.id,
+        user_id: user.id,
+      })
+      if (reply.user_id !== user.id) {
+        await supabase.from('notifications').insert({
+          user_id: reply.user_id,
+          type: 'reply_like',
+          message: `${user.email} liked your reply`,
+          article_id: reply.article_id,
+        })
+      }
+    }
   }
 
   async function handleComment(articleId, articleUserId, articleTitle) {
@@ -213,7 +278,31 @@ export default function ArticlesPage() {
     }
     setCommentInputs(prev => ({ ...prev, [articleId]: '' }))
     setPostingComment(prev => ({ ...prev, [articleId]: false }))
-    fetchArticles(user.id)
+  }
+
+  async function handleReply(comment, articleId) {
+    const text = (replyInputs[comment.id] || '').trim()
+    if (!text) return
+    setPostingReply(prev => ({ ...prev, [comment.id]: true }))
+    await supabase.from('replies').insert({
+      comment_id: comment.id,
+      article_id: articleId,
+      body: text,
+      user_id: user.id,
+      user_email: user.email,
+    })
+    if (comment.user_id !== user.id) {
+      await supabase.from('notifications').insert({
+        user_id: comment.user_id,
+        type: 'reply',
+        message: `${user.email} replied to your comment`,
+        article_id: articleId,
+      })
+    }
+    setReplyInputs(prev => ({ ...prev, [comment.id]: '' }))
+    setShowReplyInput(prev => ({ ...prev, [comment.id]: false }))
+    setOpenReplies(prev => ({ ...prev, [comment.id]: true }))
+    setPostingReply(prev => ({ ...prev, [comment.id]: false }))
   }
 
   async function handleDelete(articleId) {
@@ -236,6 +325,14 @@ export default function ArticlesPage() {
 
   function toggleComments(id) {
     setOpenComments(prev => ({ ...prev, [id]: !prev[id] }))
+  }
+
+  function toggleReplies(commentId) {
+    setOpenReplies(prev => ({ ...prev, [commentId]: !prev[commentId] }))
+  }
+
+  function toggleReplyInput(commentId) {
+    setShowReplyInput(prev => ({ ...prev, [commentId]: !prev[commentId] }))
   }
 
   function getInitials(email) {
@@ -276,7 +373,9 @@ export default function ArticlesPage() {
 
       {/* Navbar */}
       <nav className="bg-[#0a0f1e] px-6 py-4 flex items-center justify-between">
-        <span className="text-blue-400 text-sm tracking-widest font-medium">Machine Learning Hub</span>
+        <span className="text-blue-400 text-sm tracking-widest font-medium">
+          Machine Learning Hub
+        </span>
         <div className="flex items-center gap-6">
           <Link href="/" className="text-gray-500 text-xs hover:text-white transition">Home</Link>
           <Link href="/articles" className="text-white text-xs">Articles</Link>
@@ -300,16 +399,12 @@ export default function ArticlesPage() {
               )}
             </button>
 
-            {/* Notification Dropdown */}
             {notifOpen && (
               <div className="absolute right-0 top-10 w-72 bg-white border border-gray-200 rounded-xl z-50 overflow-hidden">
                 <div className="flex items-center justify-between px-4 py-2.5 border-b border-gray-100">
                   <span className="text-xs font-medium text-gray-800">Notifications</span>
                   {unreadCount > 0 && (
-                    <button
-                      onClick={markAllRead}
-                      className="text-xs text-blue-600 hover:text-blue-800 transition"
-                    >
+                    <button onClick={markAllRead} className="text-xs text-blue-600 hover:text-blue-800 transition">
                       Mark all read
                     </button>
                   )}
@@ -322,7 +417,7 @@ export default function ArticlesPage() {
                       <div
                         key={n.id}
                         onClick={() => markNotifRead(n.id)}
-                        className={`flex gap-2.5 px-4 py-3 border-b border-gray-50 cursor-pointer transition text-left ${
+                        className={`flex gap-2.5 px-4 py-3 border-b border-gray-50 cursor-pointer transition ${
                           n.is_read ? 'hover:bg-gray-50' : 'bg-blue-50 hover:bg-blue-100'
                         }`}
                       >
@@ -401,14 +496,10 @@ export default function ArticlesPage() {
 
             {/* Action row */}
             <div className="flex items-center gap-2 flex-wrap">
-
-              {/* Like */}
               <button
                 onClick={() => toggleArticleLike(article)}
                 className={`flex items-center gap-1.5 border rounded-full px-3 py-1.5 text-xs transition ${
-                  article.liked
-                    ? 'bg-blue-50 border-blue-300 text-blue-700'
-                    : 'border-gray-200 text-gray-500 hover:bg-gray-50'
+                  article.liked ? 'bg-blue-50 border-blue-300 text-blue-700' : 'border-gray-200 text-gray-500 hover:bg-gray-50'
                 }`}
               >
                 <svg width="12" height="12" viewBox="0 0 16 16" fill={article.liked ? '#185FA5' : 'none'} stroke={article.liked ? '#185FA5' : 'currentColor'} strokeWidth="1.5">
@@ -417,7 +508,6 @@ export default function ArticlesPage() {
                 {article.likeCount} {article.likeCount === 1 ? 'like' : 'likes'}
               </button>
 
-              {/* Comments toggle */}
               <button
                 onClick={() => toggleComments(article.id)}
                 className="text-xs text-gray-400 hover:text-gray-700 px-2 py-1.5 rounded-lg hover:bg-gray-50 transition"
@@ -425,7 +515,6 @@ export default function ArticlesPage() {
                 {openComments[article.id] ? 'Hide' : 'Show'} comments ({article.comments.length})
               </button>
 
-              {/* Share */}
               <button
                 onClick={() => handleShare(article.id)}
                 className="flex items-center gap-1.5 border border-gray-200 rounded-full px-3 py-1.5 text-xs text-gray-500 hover:bg-gray-50 transition"
@@ -437,7 +526,6 @@ export default function ArticlesPage() {
                 Share
               </button>
 
-              {/* Delete — only for the author */}
               {article.user_id === user.id && (
                 <button
                   onClick={() => setConfirmDelete(article.id)}
@@ -455,49 +543,127 @@ export default function ArticlesPage() {
             {confirmDelete === article.id && (
               <div className="mt-3 bg-red-50 border border-red-200 rounded-lg px-4 py-3 flex items-center gap-3 flex-wrap">
                 <p className="text-xs text-red-700 flex-1">Delete this article? This cannot be undone.</p>
-                <button
-                  onClick={() => handleDelete(article.id)}
-                  className="bg-red-500 text-white rounded-lg px-3 py-1.5 text-xs hover:bg-red-600 transition"
-                >
-                  Yes, delete
-                </button>
-                <button
-                  onClick={() => setConfirmDelete(null)}
-                  className="border border-red-200 text-red-600 rounded-lg px-3 py-1.5 text-xs hover:bg-red-100 transition"
-                >
-                  Cancel
-                </button>
+                <button onClick={() => handleDelete(article.id)} className="bg-red-500 text-white rounded-lg px-3 py-1.5 text-xs hover:bg-red-600 transition">Yes, delete</button>
+                <button onClick={() => setConfirmDelete(null)} className="border border-red-200 text-red-600 rounded-lg px-3 py-1.5 text-xs hover:bg-red-100 transition">Cancel</button>
               </div>
             )}
 
-            {/* Comments */}
+            {/* Comments section */}
             {openComments[article.id] && (
               <div className="mt-4 border-t border-gray-100 pt-4">
                 {article.comments.length === 0 && (
                   <p className="text-xs text-gray-400 mb-3">No comments yet. Be the first!</p>
                 )}
+
                 {article.comments.map(comment => (
                   <div key={comment.id} className="flex gap-2 mb-3">
-                    <div className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-medium flex-shrink-0 ${getAvatarColor(comment.user_email)}`}>
+                    <div className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-medium flex-shrink-0 mt-1 ${getAvatarColor(comment.user_email)}`}>
                       {getInitials(comment.user_email)}
                     </div>
-                    <div className="flex-1 bg-gray-50 rounded-lg px-3 py-2">
-                      <p className="text-xs font-medium text-gray-700 mb-0.5">{comment.user_email}</p>
-                      <p className="text-xs text-gray-500 leading-relaxed">{comment.body}</p>
-                      <button
-                        onClick={() => toggleCommentLike(comment, article.user_id)}
-                        className={`flex items-center gap-1 mt-1.5 text-xs transition ${
-                          comment.liked ? 'text-blue-600' : 'text-gray-400 hover:text-gray-600'
-                        }`}
-                      >
-                        <svg width="11" height="11" viewBox="0 0 16 16" fill={comment.liked ? '#185FA5' : 'none'} stroke={comment.liked ? '#185FA5' : 'currentColor'} strokeWidth="1.5">
-                          <path d="M8 13.5S1.5 9.5 1.5 5.5A3.5 3.5 0 018 3.2 3.5 3.5 0 0114.5 5.5C14.5 9.5 8 13.5 8 13.5z"/>
-                        </svg>
-                        {comment.likeCount}
-                      </button>
+                    <div className="flex-1">
+
+                      {/* Comment bubble */}
+                      <div className="bg-gray-50 rounded-lg px-3 py-2">
+                        <p className="text-xs font-medium text-gray-700 mb-0.5">{comment.user_email}</p>
+                        <p className="text-xs text-gray-500 leading-relaxed">{comment.body}</p>
+
+                        {/* Comment actions */}
+                        <div className="flex items-center gap-3 mt-2">
+                          <button
+                            onClick={() => toggleCommentLike(comment)}
+                            className={`flex items-center gap-1 text-xs transition ${comment.liked ? 'text-blue-600' : 'text-gray-400 hover:text-gray-600'}`}
+                          >
+                            <svg width="11" height="11" viewBox="0 0 16 16" fill={comment.liked ? '#185FA5' : 'none'} stroke={comment.liked ? '#185FA5' : 'currentColor'} strokeWidth="1.5">
+                              <path d="M8 13.5S1.5 9.5 1.5 5.5A3.5 3.5 0 018 3.2 3.5 3.5 0 0114.5 5.5C14.5 9.5 8 13.5 8 13.5z"/>
+                            </svg>
+                            {comment.likeCount}
+                          </button>
+
+                          {/* Reply button */}
+                          <button
+                            onClick={() => toggleReplyInput(comment.id)}
+                            className="flex items-center gap-1 text-xs text-gray-400 hover:text-gray-700 transition"
+                          >
+                            <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                              <path d="M2 6h9a3 3 0 010 6H8M2 6l3-3M2 6l3 3"/>
+                            </svg>
+                            Reply
+                          </button>
+
+                          {/* Show/hide replies toggle */}
+                          {comment.replies.length > 0 && (
+                            <button
+                              onClick={() => toggleReplies(comment.id)}
+                              className="text-xs text-blue-500 hover:text-blue-700 transition"
+                            >
+                              {openReplies[comment.id] ? '▾ Hide' : '▸ Show'} {comment.replies.length} {comment.replies.length === 1 ? 'reply' : 'replies'}
+                            </button>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Reply input */}
+                      {showReplyInput[comment.id] && (
+                        <div className="flex gap-2 mt-2 pl-1">
+                          <input
+                            autoFocus
+                            type="text"
+                            value={replyInputs[comment.id] || ''}
+                            onChange={e => setReplyInputs(prev => ({ ...prev, [comment.id]: e.target.value }))}
+                            onKeyDown={e => e.key === 'Enter' && handleReply(comment, article.id)}
+                            placeholder={`Reply to ${comment.user_email}...`}
+                            className="flex-1 border border-gray-200 rounded-lg px-3 py-1.5 text-xs outline-none focus:border-blue-400 bg-white"
+                          />
+                          <button
+                            onClick={() => handleReply(comment, article.id)}
+                            disabled={postingReply[comment.id]}
+                            className="bg-[#0a0f1e] text-white rounded-lg px-3 py-1.5 text-xs hover:opacity-80 transition"
+                          >
+                            {postingReply[comment.id] ? '...' : 'Post'}
+                          </button>
+                          <button
+                            onClick={() => toggleReplyInput(comment.id)}
+                            className="text-gray-400 hover:text-gray-600 text-xs px-1"
+                          >
+                            ✕
+                          </button>
+                        </div>
+                      )}
+
+                      {/* Replies thread */}
+                      {openReplies[comment.id] && comment.replies.length > 0 && (
+                        <div className="mt-2 pl-3 border-l-2 border-blue-100 space-y-2">
+                          {comment.replies.map(reply => (
+                            <div key={reply.id} className="flex gap-2">
+                              <div className={`w-5 h-5 rounded-full flex items-center justify-center text-xs font-medium flex-shrink-0 mt-0.5 ${getAvatarColor(reply.user_email)}`}>
+                                {getInitials(reply.user_email)}
+                              </div>
+                              <div className="flex-1 bg-white border border-gray-100 rounded-lg px-3 py-2">
+                                <p className="text-xs font-medium text-gray-700 mb-0.5">{reply.user_email}</p>
+                                <p className="text-xs text-gray-500 leading-relaxed">{reply.body}</p>
+                                <div className="flex items-center gap-2 mt-1.5">
+                                  <p className="text-xs text-gray-300">{timeAgo(reply.created_at)}</p>
+                                  <button
+                                    onClick={() => toggleReplyLike(reply)}
+                                    className={`flex items-center gap-1 text-xs transition ${reply.liked ? 'text-blue-600' : 'text-gray-400 hover:text-gray-600'}`}
+                                  >
+                                    <svg width="10" height="10" viewBox="0 0 16 16" fill={reply.liked ? '#185FA5' : 'none'} stroke={reply.liked ? '#185FA5' : 'currentColor'} strokeWidth="1.5">
+                                      <path d="M8 13.5S1.5 9.5 1.5 5.5A3.5 3.5 0 018 3.2 3.5 3.5 0 0114.5 5.5C14.5 9.5 8 13.5 8 13.5z"/>
+                                    </svg>
+                                    {reply.likeCount}
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
                     </div>
                   </div>
                 ))}
+
+                {/* New comment input */}
                 <div className="flex gap-2 mt-2">
                   <input
                     type="text"
